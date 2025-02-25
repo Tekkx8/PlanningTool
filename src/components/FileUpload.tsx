@@ -2,7 +2,6 @@ import React, { useCallback, useState } from 'react';
 import { Upload, AlertCircle, Loader2, CheckCircle2, X } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'framer-motion';
-import { format, parse } from 'date-fns';
 
 interface FileData { 
   data: any[];
@@ -16,7 +15,7 @@ interface FileUploadProps {
   isProcessing: boolean;
 }
 
-const FileUpload: React.FC<FileUploadProps> = ({ onDataLoaded, title, isProcessing }) => {
+export const FileUpload: React.FC<FileUploadProps> = ({ onDataLoaded, title, isProcessing }) => {
   const [isDragging, setIsDragging] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
@@ -72,15 +71,10 @@ const FileUpload: React.FC<FileUploadProps> = ({ onDataLoaded, title, isProcessi
   const processFile = useCallback(async (file: File) => {
     if (!validateExcelFile(file)) return;
 
+    setError(null);
     try {
       const data = await file.arrayBuffer();
-      const workbook = XLSX.read(data, { 
-        type: 'array',
-        cellDates: false,
-        cellNF: true,
-        cellText: false
-      });
-      
+      const workbook = XLSX.read(data, { type: 'array', cellDates: true, cellStyles: true, raw: true }); // Enhanced parsing
       const sheetName = workbook.SheetNames[0];
 
       if (!sheetName) {
@@ -88,166 +82,91 @@ const FileUpload: React.FC<FileUploadProps> = ({ onDataLoaded, title, isProcessi
       }
 
       const worksheet = workbook.Sheets[sheetName];
-      
+
       if (!worksheet || worksheet['!ref'] === undefined) {
         throw new Error('First sheet appears to be empty or invalid');
       }
 
-      const jsonData = XLSX.utils.sheet_to_json(worksheet, {
-        raw: true,
-        cellDates: false,
-        blankrows: false,
-        dateNF: 'yyyy-MM-dd'
-      });
+      // Attempt to parse as JSON, default to empty array if parsing fails
+      let jsonData: any[] = [];
+      try {
+        jsonData = XLSX.utils.sheet_to_json(worksheet, { raw: true, header: 1 }) || [];
+        // Convert array of arrays to array of objects if necessary
+        if (Array.isArray(jsonData) && jsonData.length > 0 && Array.isArray(jsonData[0])) {
+          const headers = jsonData[0] as string[];
+          jsonData = jsonData.slice(1).map((row: any[]) => 
+            headers.reduce((obj, header, i) => {
+              const value = row[i];
+              // Handle numeric or string values for stock fields
+              if (header.toLowerCase().includes('stock weight') && typeof value === 'number') {
+                return { ...obj, [header]: `${value} KG` };
+              }
+              if (header.toLowerCase().includes('real stock age') && typeof value === 'number') {
+                return { ...obj, [header]: value };
+              }
+              return { ...obj, [header]: value };
+            }, {})
+          ).filter(row => Object.keys(row).length > 0); // Filter out empty rows
+        } else {
+          jsonData = jsonData.filter(row => Object.keys(row).length > 0); // Filter out empty objects
+        }
+      } catch (parseError) {
+        console.warn('Parsing error, treating as empty:', parseError);
+        jsonData = [];
+      }
 
       if (!Array.isArray(jsonData)) {
         throw new Error('Invalid data format in Excel file');
       }
 
       if (jsonData.length === 0) {
-        throw new Error('No data found in the Excel file. Please ensure the file contains data rows.');
+        throw new Error('No data found in the first sheet');
       }
 
-      if (!jsonData[0] || typeof jsonData[0] !== 'object') {
-        throw new Error('Invalid data format. Please ensure the file contains proper column headers and data.');
+      const headers = Object.keys(jsonData[0] || {}).map(h => h.toLowerCase().trim());
+      
+      if (headers.length === 0) {
+        throw new Error('No column headers found in the Excel file');
       }
-      
-      const headers = Object.keys(jsonData[0]).map(h => h.toLowerCase().trim());
-      
-      // First try to detect by filename
-      const detectFileTypeByName = (filename: string): 'stock' | 'orders' | null => {
-        const name = filename.toLowerCase();
-        if (name.includes('stock')) return 'stock';
-        if (name.includes('l07')) return 'orders';
-        return null;
-      };
 
-      // Detect file type based on content pattern
-      const detectFileType = (data: any[], headers: string[]): 'stock' | 'orders' | null => {
-        // Check first row for characteristic columns
-        const firstRow = data[0];
-        const lowerHeaders = headers.map(h => h.toLowerCase());
-        
-        // Stock file pattern
-        const stockHeaders = ['batch number', 'stock weight', 'material id'];
-        if (stockHeaders.every(h => lowerHeaders.some(header => header.includes(h)))) {
-          return 'stock';
-        }
+      const isStockFile = headers.some(h => 
+        h.includes('stock') || 
+        h.includes('batch') ||
+        h.includes('weight') ||
+        h.includes('age')
+      );
+      
+      const isOrderFile = headers.some(h => 
+        h.includes('loading') || 
+        h.includes('sales') ||
+        h.includes('order') || 
+        h.includes('quantity')
+      );
 
-        // L07 orders file pattern
-        const l07Headers = ['sales document', 'loading date', 'soldtoparty', 'order'];
-        if (l07Headers.every(h => lowerHeaders.some(header => header.includes(h)))) {
-          return 'orders';
-        }
-        
-        return null;
-      };
-      
-      // Try filename detection first, then fall back to content detection
-      let fileType = detectFileTypeByName(file.name) || detectFileType(jsonData, headers);
-      
-      if (!fileType) {
+      if (!isStockFile && !isOrderFile) {
         throw new Error(
-          'Could not determine file type. Please ensure the file name contains "stock", "l07", or "orders",\n' +
-          'or that it contains the required columns:\n\n' +
-          'For Stock data:\n' +
-          '- Batch Number\n' +
-          '- Stock Weight\n' +
-          '- Material ID\n\n' +
-          'For Order data (either):\n' +
-          '- Sales Document, Loading Date, SoldToParty, Order'
+          'Could not determine file type. Please ensure the Excel file contains either:\n' +
+          '- Stock data (with columns for stock, batch, weight, or age)\n' +
+          '- Order data (with columns for loading, sales, order, or quantity)'
         );
       }
 
-      // Pre-process data to ensure consistent formats
-      const processedData = jsonData.map(row => {
-        const newRow = { ...row };
-        
-        // Handle loading date in different formats
-        const loadingDateKey = 'Loading Date' in newRow ? 'Loading Date' : 'Loading date';
-        if (loadingDateKey in newRow) {
-          let loadingDate = newRow[loadingDateKey];
-          
-          // Handle Excel date number format
-          if (typeof loadingDate === 'number') {
-            const date = new Date(Math.round((loadingDate - 25569) * 86400 * 1000));
-            loadingDate = format(date, 'yyyy-MM-dd');
-          }
-          
-          let date: Date | null = null;
-
-          try {
-            if (loadingDate instanceof Date) {
-              date = loadingDate;
-            } else if (typeof loadingDate === 'number') {
-              date = new Date(Math.round((loadingDate - 25569) * 86400 * 1000));
-            } else if (typeof loadingDate === 'string') {
-              // Try different date formats
-              const formats = ['dd/MM/yyyy', 'M/d/yyyy', 'yyyy-MM-dd'];
-              for (const fmt of formats) {
-                try {
-                  date = parse(loadingDate, fmt, new Date());
-                  if (!isNaN(date.getTime())) break;
-                } catch {
-                  continue;
-                }
-              }
-            }
-
-            if (!date || isNaN(date.getTime())) {
-              throw new Error('Invalid date format');
-            }
-
-            newRow[loadingDateKey] = format(date, 'yyyy-MM-dd');
-          } catch (error) {
-            console.warn('Error parsing date:', loadingDate);
-            newRow[loadingDateKey] = format(new Date(), 'yyyy-MM-dd');
-          }
+      // Validate stock-specific headers if it's a stock file
+      if (isStockFile) {
+        const requiredStockHeaders = ['batch number', 'stock weight', 'real stock age'];
+        if (!requiredStockHeaders.every(header => headers.includes(header))) {
+          throw new Error('Missing required stock headers. Ensure columns for Batch Number, Stock Weight, and Real Stock Age exist.');
         }
-        
-        // Handle stock weight
-        if ('Stock Weight' in newRow) {
-          const weightStr = String(newRow['Stock Weight']);
-          const matches = weightStr.match(/(\d+(?:\.\d+)?)/);
-          const weight = matches ? parseFloat(matches[1]) : 0;
-          newRow['Stock Weight'] = isNaN(weight) ? 0 : weight;
-        }
-        
-        // Handle sales quantity
-        if ('SalesQuantityKG' in newRow) {
-          const quantityStr = String(newRow['SalesQuantityKG']);
-          const matches = quantityStr.match(/(\d+(?:\.\d+)?)/);
-          const quantity = matches ? parseFloat(matches[1]) : 0;
-          newRow['SalesQuantityKG'] = isNaN(quantity) ? 0 : quantity;
-        }
-        
-        // Normalize column names
-        if ('Sales Document' in newRow) {
-          newRow['Sales document'] = newRow['Sales Document'];
-          delete newRow['Sales Document'];
-        }
-        
-        if ('Sales Document Item' in newRow) {
-          newRow['Sales document item'] = String(newRow['Sales Document Item'] || '10');
-          delete newRow['Sales Document Item'];
-        }
-        
-        // Ensure Sales document item is always a string
-        if ('Sales document item' in newRow) {
-          newRow['Sales document item'] = String(newRow['Sales document item'] || '10');
-        }
-        
-        return newRow;
-      });
+      }
 
       onDataLoaded({
-        data: processedData,
-        type: fileType,
+        data: jsonData,
+        type: isStockFile ? 'stock' : 'orders',
         filename: file.name
       });
     } catch (err) {
       const message = err instanceof Error ? err.message : 
-        'Error processing file. Please ensure it\'s a valid Excel file with proper data and column headers.';
+        'Error processing file. Please ensure it’s a valid Excel file with data in the first sheet.';
       
       console.error('File processing error:', {
         error: err,
@@ -257,9 +176,7 @@ const FileUpload: React.FC<FileUploadProps> = ({ onDataLoaded, title, isProcessi
       
       setError(message);
       
-      if (fileInputRef.current) {
-        fileInputRef.current.value = '';
-      }
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
   }, [onDataLoaded]);
 
@@ -298,13 +215,11 @@ const FileUpload: React.FC<FileUploadProps> = ({ onDataLoaded, title, isProcessi
       </div>
 
       {error && (
-        <div className="flex items-center gap-2 text-red-400 bg-red-900/20 p-3 rounded-lg border border-red-500/20">
+        <div className="flex items-center gap-2 text-red-400 bg-red-900/20 p-3 rounded-lg border border-red-500/20 w-full">
           <AlertCircle className="w-5 h-5 flex-shrink-0" />
           <p className="text-sm">{error}</p>
         </div>
       )}
     </div>
   );
-}
-
-export { FileUpload }
+};
