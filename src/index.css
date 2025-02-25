@@ -1,0 +1,226 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+}
+
+/* Custom scrollbar for panels */
+.panel-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(59, 130, 246, 0.5) transparent;
+}
+
+.panel-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.panel-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.panel-scroll::-webkit-scrollbar-thumb {
+  background-color: rgba(59, 130, 246, 0.5);
+  border-radius: 3px;
+}
+
+/* Smooth transitions */
+.panel-transition {
+  transition: all 0.3s ease-in-out;
+}
+
+/* Responsive container */
+.responsive-container {
+  width: 100%;
+  max-width: 1920px;
+  margin: 0 auto;
+  padding: 0 1rem;
+}
+
+@media (min-width: 640px) {
+  .responsive-container {
+    padding: 0 2rem;
+  }
+}
+
+@media (min-width: 1024px) {
+  .responsive-container {
+    padding: 0 4rem;
+  }
+}
+
+body {
+  background-color: #070d1f;
+  min-height: 100vh;
+  color: #fff;
+  overflow-x: hidden;
+  background-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.8), rgba(10, 31, 68, 0.9)),
+                    url('https://images.unsplash.com/photo-1597474561103-0435361c9e04?auto=format&fit=crop&q=80');
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+}
+
+/* Ensure background extends fully */
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+main {
+  flex: 1;
+  width: 100%;
+  position: relative;
+  z-index: 1;
+}
+
+/* Scrollable Panel Styles */
+.scrollable-panel {
+  @apply overflow-y-auto overflow-x-hidden;
+  height: calc(100vh - var(--panel-offset, 12rem));
+  scrollbar-width: thin;
+  scrollbar-color: rgba(59, 130, 246, 0.3) transparent;
+}
+
+.scrollable-panel::-webkit-scrollbar {
+  width: 6px;
+}
+
+.scrollable-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollable-panel::-webkit-scrollbar-thumb {
+  @apply bg-blue-500/30 rounded-full hover:bg-blue-500/50 transition-colors;
+}
+
+/* Panel Header */
+.panel-header {
+  @apply sticky top-0 z-10 bg-black/60 backdrop-blur-md border-b border-blue-500/20 px-6 py-4;
+}
+
+/* Panel Content */
+.panel-content {
+  @apply p-6;
+}
+
+/* Responsive container sizes */
+.container {
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: 1rem;
+  padding-right: 1rem;
+}
+
+@screen sm {
+  .container {
+    max-width: 640px;
+  }
+}
+
+@screen md {
+  .container {
+    max-width: 768px;
+  }
+}
+
+@screen lg {
+  .container {
+    max-width: 1024px;
+  }
+}
+
+@screen xl {
+  .container {
+    max-width: 1280px;
+  }
+}
+
+@screen 2xl {
+  .container {
+    max-width: 1920px;
+  }
+}
+
+/* Carousel Navigation */
+.carousel-nav {
+  @apply absolute top-1/2 -translate-y-1/2 z-10 p-2 rounded-full bg-blue-600/80 text-white 
+         hover:bg-blue-700 transition-colors backdrop-blur-sm;
+}
+
+.carousel-nav.prev {
+  @apply left-4;
+}
+
+.carousel-nav.next {
+  @apply right-4;
+}
+
+/* Swiper Custom Styles */
+.swiper-slide {
+  height: auto !important;
+}
+
+.swiper-button-next,
+.swiper-button-prev {
+  @apply text-blue-400 !important;
+}
+
+.swiper-pagination-bullet {
+  @apply bg-blue-400 !important;
+}
+
+.swiper-pagination-bullet-active {
+  @apply bg-blue-600 !important;
+}
+
+/* Ensure background extends fully */
+#root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+main {
+  flex: 1;
+  width: 100%;
+}
+
+/* Custom scrollbar for panels */
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(59, 130, 246, 0.3) transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background-color: rgba(59, 130, 246, 0.3);
+  border-radius: 3px;
+  transition: background-color 0.2s;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(59, 130, 246, 0.5);
+}
+
+.drag-active {
+  @apply border-blue-500 bg-blue-500/10;
+}
+
+/* Responsive grid layouts */
+.grid-auto-fit {
+  grid-template-columns: repeat(auto-fit, minmax(var(--min-width, 300px), 1fr));
+  gap: var(--gap, 1.5rem);
+}
