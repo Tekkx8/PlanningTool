@@ -1,150 +1,98 @@
-import React, { useState, useEffect } from 'react';
-import { ChevronDown, ChevronUp } from 'lucide-react';
-import { Customer, CustomerRestrictions, StockItem } from '../types';
+import React, { useState } from 'react';
+import { Customer } from '../types';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
+import { Input } from './ui/input';
 
 interface CustomerRestrictionFormProps {
-  stock: StockItem[];
-  onAddCustomer: (customer: Customer) => void;
-  customerNames: string[];
-  editingCustomer: Customer | null;
-  onCancelEdit: () => void;
+  customer: Customer;
+  stock: any[];
+  onUpdate: (updatedCustomer: Customer) => void;
 }
 
-export const CustomerRestrictionForm: React.FC<CustomerRestrictionFormProps> = ({
-  stock,
-  onAddCustomer,
-  customerNames,
-  editingCustomer,
-  onCancelEdit,
-}) => {
-  const [isExpanded, setIsExpanded] = useState(true);
-  const [selectedCustomer, setSelectedCustomer] = useState<string>('');
-  const [restrictions, setRestrictions] = useState<CustomerRestrictions>({});
+export const CustomerRestrictionForm: React.FC<CustomerRestrictionFormProps> = ({ customer, stock, onUpdate }) => {
+  const [restrictions, setRestrictions] = useState(customer.restrictions);
 
-  useEffect(() => {
-    if (editingCustomer) {
-      setSelectedCustomer(editingCustomer.name);
-      setRestrictions(editingCustomer.restrictions);
-      setIsExpanded(true);
-    }
-  }, [editingCustomer]);
-
-  const getUniqueValues = (field: keyof StockItem) => {
-    const values = new Set(stock.map(item => item[field]).filter(Boolean));
-    return Array.from(values).sort();
+  const handleChange = (field: string, value: string) => {
+    setRestrictions(prev => ({ ...prev, [field]: value || undefined }));
   };
+
+  const uniqueOrigins = [...new Set(stock.map(item => item['Origin Country'] || ''))].filter(Boolean).sort();
+  const uniqueVarieties = [...new Set(stock.map(item => item['Variety'] || ''))].filter(Boolean).sort();
+  const uniqueGGNs = [...new Set(stock.map(item => item['GGN'] || ''))].filter(Boolean).sort();
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedCustomer) return;
-
-    onAddCustomer({
-      id: editingCustomer?.id || crypto.randomUUID(),
-      name: selectedCustomer,
-      restrictions
-    });
-
-    // Reset form
-    setSelectedCustomer('');
-    setRestrictions({});
-    setIsExpanded(false);
-    onCancelEdit();
+    onUpdate({ ...customer, restrictions });
   };
-
-  const handleFieldChange = (field: keyof CustomerRestrictions, value: string) => {
-    setRestrictions(prev => ({
-      ...prev,
-      [field]: value === 'N/A' ? undefined : value
-    }));
-  };
-
-  const fields = [
-    { field: 'Origin Country', label: 'Origin' },
-    { field: 'Variety', label: 'Variety' },
-    { field: 'GGN', label: 'GGN' },
-    { field: 'Q3: Reinspection Quality', label: 'Quality' },
-    { field: 'BL/AWB/CMR', label: 'BL/AWB/CMR' },
-    { field: 'MinimumSize', label: 'Minimum Size' },
-    { field: 'Origin Pallet Number', label: 'Origin Pallet Number' },
-    { field: 'Supplier', label: 'Supplier' }
-  ];
 
   return (
-    <div className="bg-black/20 rounded-lg p-4 mb-4 border border-blue-500/10">
-      <div 
-        className="flex justify-between items-center cursor-pointer"
-        onClick={() => setIsExpanded(!isExpanded)}
-      >
-        <h3 className="text-lg font-medium text-white">
-          {editingCustomer ? `Edit ${editingCustomer.name}` : 'Add Customer Restrictions'}
-        </h3>
-        {isExpanded ? (
-          <ChevronUp size={20} className="text-blue-400" />
-        ) : (
-          <ChevronDown size={20} className="text-blue-400" />
-        )}
+    <form onSubmit={handleSubmit} className="space-y-4 bg-black/20 rounded-lg border border-blue-500/10 p-4">
+      <div className="space-y-2">
+        <label className="text-sm text-blue-400">Origin Country</label>
+        <Select
+          value={restrictions['Origin Country'] || ''}
+          onValueChange={(value) => handleChange('Origin Country', value)}
+        >
+          <SelectTrigger className="bg-black/30 border-blue-500/20 text-white">
+            <SelectValue placeholder="Select origin" />
+          </SelectTrigger>
+          <SelectContent className="bg-black/40 border-blue-500/20 text-white">
+            <SelectItem value="">None</SelectItem>
+            {uniqueOrigins.map(origin => (
+              <SelectItem key={origin} value={origin} className="hover:bg-blue-500/20">
+                {origin}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </div>
 
-      {isExpanded && (
-        <form onSubmit={handleSubmit} className="mt-4 space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-blue-300">
-              Customer
-            </label>
-            <select
-              value={selectedCustomer}
-              onChange={(e) => setSelectedCustomer(e.target.value)}
-              className="mt-1 block w-full rounded-md border-blue-500/20 bg-black/40 text-white shadow-sm focus:border-blue-500 focus:ring focus:ring-blue-500/20"
-              disabled={!!editingCustomer}
-            >
-              <option value="">Select Customer</option>
-              {customerNames.map(name => (
-                <option key={name} value={name}>{name}</option>
-              ))}
-            </select>
-          </div>
+      <div className="space-y-2">
+        <label className="text-sm text-blue-400">Variety</label>
+        <Select
+          value={restrictions['Variety'] || ''}
+          onValueChange={(value) => handleChange('Variety', value)}
+        >
+          <SelectTrigger className="bg-black/30 border-blue-500/20 text-white">
+            <SelectValue placeholder="Select variety" />
+          </SelectTrigger>
+          <SelectContent className="bg-black/40 border-blue-500/20 text-white">
+            <SelectItem value="">None</SelectItem>
+            {uniqueVarieties.map(variety => (
+              <SelectItem key={variety} value={variety} className="hover:bg-blue-500/20">
+                {variety}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
 
-          {selectedCustomer && (
-            <>
-              {fields.map(({ field, label }) => (
-                <div key={field}>
-                  <label className="block text-sm font-medium text-blue-300">
-                    {label}
-                  </label>
-                  <select
-                    value={restrictions[field as keyof CustomerRestrictions] || 'N/A'}
-                    onChange={(e) => handleFieldChange(field as keyof CustomerRestrictions, e.target.value)}
-                    className="mt-1 block w-full rounded-md border-blue-500/20 bg-black/40 text-white shadow-sm focus:border-blue-500 focus:ring focus:ring-blue-500/20"
-                  >
-                    <option value="N/A">N/A</option>
-                    {getUniqueValues(field as keyof StockItem).map(value => (
-                      <option key={value} value={value}>{value}</option>
-                    ))}
-                  </select>
-                </div>
-              ))}
+      <div className="space-y-2">
+        <label className="text-sm text-blue-400">GGN</label>
+        <Select
+          value={restrictions['GGN'] || ''}
+          onValueChange={(value) => handleChange('GGN', value)}
+        >
+          <SelectTrigger className="bg-black/30 border-blue-500/20 text-white">
+            <SelectValue placeholder="Select GGN" />
+          </SelectTrigger>
+          <SelectContent className="bg-black/40 border-blue-500/20 text-white">
+            <SelectItem value="">None</SelectItem>
+            {uniqueGGNs.map(ggn => (
+              <SelectItem key={ggn} value={ggn} className="hover:bg-blue-500/20">
+                {ggn}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
 
-              <div className="flex gap-2">
-                <button
-                  type="submit"
-                  className="flex-1 bg-blue-600 text-white py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-black transition-colors"
-                >
-                  {editingCustomer ? 'Update Restrictions' : 'Apply Restrictions'}
-                </button>
-                {editingCustomer && (
-                  <button
-                    type="button"
-                    onClick={onCancelEdit}
-                    className="flex-1 bg-gray-600 text-white py-2 px-4 rounded-md hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-gray-500 focus:ring-offset-2 focus:ring-offset-black transition-colors"
-                  >
-                    Cancel
-                  </button>
-                )}
-              </div>
-            </>
-          )}
-        </form>
-      )}
-    </div>
+      <button
+        type="submit"
+        className="w-full bg-blue-600 text-white py-2 rounded-lg hover:bg-blue-700 transition-colors"
+      >
+        Update Restrictions
+      </button>
+    </form>
   );
 };
