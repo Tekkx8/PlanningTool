@@ -8,12 +8,13 @@ import { StockDashboard } from './components/StockDashboard';
 import { ScrollablePanel } from './components/ScrollablePanel';
 import { ProductionDashboard } from './components/ProductionDashboard';
 import { SidePanel } from './components/SidePanel';
-import { StockItem, OrderItem, Customer, AllocationResult } from './types';
+import { StockItem, OrderItem, Customer, AllocationResult, AllocationNotification } from './types';
 import { ClipboardList, Settings, RotateCcw, LayoutDashboard, CheckCircle2, X, ArrowRight, Download, AlertCircle } from 'lucide-react';
 import { Logo } from './components/Logo';
 import * as XLSX from 'xlsx';
 import { parse, format, parseISO } from 'date-fns';
 import { AllocationManager } from './utils/allocationManager';
+import { ChevronDown, ChevronUp } from 'lucide-react';
 
 function App() {
   const [stock, setStock] = useState<StockItem[]>([]);
@@ -21,6 +22,13 @@ function App() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [activeTab, setActiveTab] = useState<'allocation' | 'stock' | 'production'>('allocation');
   const [sidePanelOpen, setSidePanelOpen] = useState(false);
+  const [orderMapping, setOrderMapping] = useState<{
+    bySalesDocItem: Record<string, { order: string; material: string }>;
+  }>({
+    bySalesDocItem: {}
+  });
+  const [mappingErrors, setMappingErrors] = useState<Set<string>>(new Set());
+  const [uploadedFiles, setUploadedFiles] = useState<string[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isAllocationFlipped, setIsAllocationFlipped] = useState(false);
   const [allocationResults, setAllocationResults] = useState<AllocationResult[]>([]);
@@ -34,13 +42,261 @@ function App() {
     };
   });
   const [allocationManager] = useState(() => new AllocationManager());
+  const [allocationMessages, setAllocationMessages] = useState<{
+    errors: string[];
+    warnings: string[];
+  }>({ errors: [], warnings: [] });
+  const [notifications, setNotifications] = useState<AllocationNotification[]>([]);
+  const [showAllocationModal, setShowAllocationModal] = useState(false);
   const [includeSpotSales, setIncludeSpotSales] = useState(true);
+  const [showOrganicModal, setShowOrganicModal] = useState(false);
+  const [currentOrder, setCurrentOrder] = useState<OrderItem | null>(null);
+  const [collapsedCustomers, setCollapsedCustomers] = useState<Set<string>>(new Set());
+
+  const isOrganic = React.useCallback((item: StockItem) => {
+    const materialId = item['Material ID']?.toLowerCase() || '';
+    return materialId.includes('org') ||
+           materialId.includes('organic') ||
+           materialId.startsWith('bob') ||
+           materialId.startsWith('bio');
+  }, []);
+
+  const isSpotSale = React.useCallback((item: OrderItem) => {
+    const material = item.Material?.toLowerCase() || '';
+    return material.startsWith('bcb') || material.startsWith('bob');
+  }, []);
 
   const { transform, opacity } = useSpring({
     opacity: isAllocationFlipped ? 1 : 0,
     transform: `perspective(600px) rotateY(${isAllocationFlipped ? 180 : 0}deg)`,
     config: { mass: 5, tension: 500, friction: 80 }
   });
+
+  const handleStockUpload = (fileData: { data: any[], type: 'stock' | 'orders', filename: string }) => {
+    if (fileData.type === 'orders') {
+      handleOrdersUpload(fileData);
+      return;
+    }
+    
+    allocationManager.storage.beginAllocationBatch();
+    
+    const processedData = Array.isArray(fileData.data) ? fileData.data : [];
+    
+    if (processedData.length === 0) {
+      setAllocationMessages({
+        errors: ['No data found in stock file. Please check the data in stock.xlsx.'],
+        warnings: []
+      });
+      allocationManager.storage.rollbackAllocationBatch();
+      return;
+    }
+
+    const processedStock = processedData.map(item => ({
+      ...item,
+      'Stock Weight': parseFloat(String(item['Stock Weight']).replace(' KG', '')) || 0,
+      'Real Stock Age': parseInt(String(item['Real Stock Age'] || '0'), 10) || 0
+    }));
+    
+    allocationManager.storage.resetAllocations(processedStock);
+    setStock(processedStock);
+    setUploadedFiles(prev => [...prev, fileData.filename]);
+    
+    const result = allocationManager.processNewData(processedStock, orders);
+    
+    if (result.errors.length > 0) {
+      allocationManager.storage.rollbackAllocationBatch();
+    } else {
+      allocationManager.storage.commitAllocationBatch();
+    }
+    
+    setAllocationMessages({
+      errors: result.errors,
+      warnings: result.warnings
+    });
+  };
+
+  const handleOrdersUpload = (fileData: { data: any[], type: 'stock' | 'orders', filename: string }) => {
+    if (fileData.type === 'stock') {
+      handleStockUpload(fileData);
+      return;
+    }
+    
+    allocationManager.storage.beginAllocationBatch();
+    
+    const isMappingFile = fileData.data.some(row => 
+      row.Order && row['Sales Document']
+    );
+
+    if (isMappingFile) {
+      const mappings = fileData.data.reduce((acc, row) => {
+        if (!row['Sales Document'] || !row.Order) {
+          return acc;
+        }
+
+        const salesDoc = row['Sales Document']?.toString();
+        const salesDocItem = row['Sales Document Item'] || '10';
+        const order = row.Order;
+        const material = row.Material;
+        const key = `${salesDoc}-${salesDocItem}`;
+
+        acc.bySalesDocItem[key] = { 
+          order, 
+          material: material || ''
+        };
+
+        return acc;
+      }, {
+        bySalesDocItem: {} as Record<string, { order: string; material: string }>
+      });
+      
+      setOrderMapping(mappings);
+      
+      setOrders(prevOrders => prevOrders.map(order => ({
+        ...order,
+        Order: getMappedOrder(order, mappings) || order.Order || '',
+        Material: getMappedMaterial(order, mappings)
+      })).filter(Boolean));
+
+      setUploadedFiles(prev => [...prev, fileData.filename]);
+      
+      const result = allocationManager.processNewData(stock, orders);
+      if (result.errors.length > 0) {
+        allocationManager.storage.rollbackAllocationBatch();
+      } else {
+        allocationManager.storage.commitAllocationBatch();
+      }
+      
+      setAllocationMessages({
+        errors: result.errors,
+        warnings: result.warnings
+      });
+      
+      return;
+    }
+    
+    const processedOrders = fileData.data
+      .filter(order => {
+        const status = order.OrderStatus?.toLowerCase() || '';
+        return status !== 'delivered' && status !== 'shipped' && status !== 'finished' && status !== 'in delivery';
+      })
+      .map(order => {
+        try {
+          if (!order['Sales document'] || !order['Loading Date']) {
+            console.warn('Skipping order due to missing required fields:', order);
+            return null;
+          }
+
+          const isOrganic = order['Material Description']?.toLowerCase().includes('org') ||
+                          order['Material Description']?.toLowerCase().includes('organic');
+
+          let date;
+          const loadingDate = order['Loading Date'] || order.LoadingDate;
+          if (typeof loadingDate === 'number') {
+            date = new Date(Math.round((loadingDate - 25569) * 86400 * 1000));
+          } else {
+            const dateStr = String(loadingDate).trim();
+            try {
+              date = parse(dateStr, 'dd/MM/yyyy', new Date());
+            } catch {
+              try {
+                date = parse(dateStr, 'M/d/yyyy', new Date());
+              } catch {
+                try {
+                  date = parse(dateStr, 'yyyy-MM-dd', new Date());
+                } catch {
+                  const numDate = parseFloat(dateStr);
+                  if (!isNaN(numDate)) {
+                    date = new Date(Math.round((numDate - 25569) * 86400 * 1000));
+                  } else {
+                    console.error('Could not parse date:', dateStr);
+                    throw new Error('Invalid date format');
+                  }
+                }
+              }
+            }
+          }
+
+          if (isNaN(date.getTime())) {
+            throw new Error('Invalid date');
+          }
+
+          const quantityKG = parseFloat(String(order.SalesQuantityKG || '0').replace(/[^\d.-]/g, '')) || 0;
+
+          const salesDocKey = order['Sales document'];
+          
+          if (mappingErrors.has(salesDocKey)) {
+            console.warn(`Skipping record with mapping error for Sales Document: ${salesDocKey}`);
+            return null;
+          }
+
+          const mappedData = getMappedData(order, orderMapping);
+          const material = mappedData?.material || order.Material || '';
+          const orderNumber = mappedData?.order || order.Order || '';
+          const isSpotSale = material ? 
+            material.startsWith('bcb') || material.startsWith('bob') :
+            order['Material Description']?.toLowerCase().includes('spot') || false;
+
+          return {
+            ...order,
+            'Loading Date': format(date, 'yyyy-MM-dd'),
+            Order: orderNumber,
+            'Sales document': order['Sales document'],
+            'Sales document item': order['Sales Document Item']?.toString() || '10',
+            SalesQuantityKG: String(quantityKG),
+            SalesQuantityCS: String(parseFloat(String(order.SalesQuantityCS || '0').replace(/[^\d.-]/g, '')) || '0'),
+            Material: material,
+            OrderStatus: order.OrderStatus?.toLowerCase() || 'pending',
+            isOrganic,
+            isSpotSale
+          };
+        } catch (error) {
+          console.error('Error processing order:', order, error);
+          return null;
+        }
+      })
+      .filter((order): order is OrderItem => order !== null);
+
+    setOrders(processedOrders);
+    setUploadedFiles(prev => [...prev, fileData.filename]);
+
+    const result = allocationManager.processNewData(stock, processedOrders);
+    
+    if (result.errors.length > 0) {
+      allocationManager.storage.rollbackAllocationBatch();
+    } else {
+      allocationManager.storage.commitAllocationBatch();
+    }
+    
+    setAllocationMessages({
+      errors: result.errors,
+      warnings: result.warnings
+    });
+
+    const uniqueCustomers = new Set(processedOrders.map(order => order.SoldToParty));
+    const initialCustomers = Array.from(uniqueCustomers).map(name => ({
+      id: crypto.randomUUID(),
+      name,
+      restrictions: {}
+    }));
+    setCustomers(initialCustomers);
+  };
+
+  const getMappedData = (order: any, mappings: typeof orderMapping) => {
+    const salesDoc = order['Sales document']?.toString();
+    const salesDocItem = order['Sales document item']?.toString() || '10';
+    const key = `${salesDoc}-${salesDocItem}`;
+    return mappings.bySalesDocItem[key];
+  };
+
+  const getMappedOrder = (order: any, mappings: typeof orderMapping) => {
+    const data = getMappedData(order, mappings);
+    return data?.order || order.Order || '';
+  };
+
+  const getMappedMaterial = (order: any, mappings: typeof orderMapping) => {
+    const data = getMappedData(order, mappings);
+    return data?.material || order.Material || '';
+  };
 
   const handleUpdateCustomer = (updatedCustomer: Customer) => {
     setCustomers(prev => prev.map(customer => 
@@ -52,17 +308,24 @@ function App() {
     setCustomers(prev => prev.filter(customer => customer.id !== customerId));
   };
 
-  const downloadAllocation = useCallback(() => {
-    if (!allocationResults.length) return;
+  const addNotification = (notification: Omit<AllocationNotification, 'id'>) => {
+    const id = crypto.randomUUID();
+    setNotifications(prev => [...prev, { ...notification, id }]);
+    
+    if (!notification.action) {
+      setTimeout(() => {
+        dismissNotification(id);
+      }, 10000);
+    }
+  };
 
-    const wb = XLSX.utils.book_new();
-    const ws = XLSX.utils.json_to_sheet(allocationResults);
-    XLSX.utils.book_append_sheet(wb, ws, 'Allocation');
-    XLSX.writeFile(wb, 'fruit-allocation.xlsx');
-  }, [allocationResults]);
+  const dismissNotification = (id: string) => {
+    setNotifications(prev => prev.filter(n => n.id !== id));
+  };
 
   const allocateFruit = useCallback(() => {
-    // Filter orders by date range
+    allocationManager.storage.beginAllocationBatch();
+    
     const filteredOrders = orders.filter(order => {
       const orderDate = parseISO(order['Loading Date']);
       return (
@@ -71,10 +334,18 @@ function App() {
       );
     });
 
-    // Filter by spot sales if needed
     const relevantOrders = includeSpotSales ? 
       filteredOrders : 
       filteredOrders.filter(order => !order.isSpotSale);
+
+    // Aggregate orders by customer and type
+    const customerOrders: Record<string, Record<'conventional' | 'organic', number>> = {};
+    relevantOrders.forEach(order => {
+      const customer = order.SoldToParty || '';
+      const type = order.isOrganic ? 'organic' : 'conventional';
+      if (!customerOrders[customer]) customerOrders[customer] = { conventional: 0, organic: 0 };
+      customerOrders[customer][type] += parseFloat(order.SalesQuantityKG) || 0;
+    });
 
     const allocation: AllocationResult[] = stock.map((item, index) => ({
       ...item,
@@ -84,7 +355,7 @@ function App() {
       allocationDetails: undefined
     }));
 
-    // Sort stock by quality and age
+    // Sort stock by quality and age (Poor/Fair before Good, oldest first)
     allocation.sort((a, b) => {
       const qualityOrder = {
         'Poor M/C': 0,
@@ -97,357 +368,158 @@ function App() {
       const qualityA = qualityOrder[a['Q3: Reinspection Quality'] as keyof typeof qualityOrder] ?? 999;
       const qualityB = qualityOrder[b['Q3: Reinspection Quality'] as keyof typeof qualityOrder] ?? 999;
       
-      // First sort by quality
       if (qualityA !== qualityB) return qualityA - qualityB;
-      
-      // Then by age (oldest first)
       return b['Real Stock Age'] - a['Real Stock Age'];
     });
 
-    // Process orders chronologically by loading date
-    const sortedOrders = [...relevantOrders].sort((a, b) => 
-      parseISO(a['Loading Date']).getTime() - parseISO(b['Loading Date']).getTime()
-    ).filter(order => {
-      const status = order.OrderStatus?.toLowerCase() || '';
-      return status !== 'delivered' && status !== 'in delivery';
-    });
+    const allocationsByCustomer: Record<string, { conventional: AllocationResult[], organic: AllocationResult[] }> = {};
 
-    for (const order of sortedOrders) {
-      const customer = customers.find(c => c.name === order.SoldToParty);
-      if (!customer) continue;
-      
-      const requiredQuantity = parseFloat(order.SalesQuantityKG.replace(/[^\d.-]/g, ''));
-      let remainingQuantity = requiredQuantity;
-      
-      // Calculate extra allocation for production orders (10% more)
-      const targetQuantity = order.isSpotSale ? 
-        requiredQuantity : 
-        requiredQuantity * 1.1; // 10% extra for production orders
+    Object.entries(customerOrders).forEach(([customerName, totals]) => {
+      allocationsByCustomer[customerName] = { conventional: [], organic: [] };
 
-      // Find matching stock items that meet all criteria
-      const matchingStock = allocation.filter(item => {
-        // Skip if already allocated
-        if (item.customer) return false;
+      ['conventional', 'organic'].forEach(type => {
+        if (totals[type] === 0) return;
 
-        // Check customer restrictions
-        return Object.entries(customer.restrictions).every(([key, value]) => {
-          if (!value) return true; // Skip if no restriction
-          return item[key as keyof StockItem] === value;
+        const targetQuantity = type === 'organic' || !isSpotSale(orders.find(o => o.SoldToParty === customerName)) 
+          ? totals[type] * 1.1 // +10% for production orders
+          : totals[type]; // Exact match for spot sales
+
+        let remainingQuantity = targetQuantity;
+        const customer = customers.find(c => c.name === customerName);
+        if (!customer) return;
+
+        const matchingStock = allocation.filter(item => {
+          const stockWeight = parseFloat(String(item['Stock Weight']).replace(' KG', '')) || 0;
+          const existingAllocations = allocationManager.storage.getAllocationsByBatch(item['Batch Number']);
+          const totalAllocated = existingAllocations.reduce((sum, a) => sum + (a.quantityKG || 0), 0);
+          const remainingStock = stockWeight - totalAllocated;
+
+          if (remainingStock <= 0) return false;
+
+          if (existingAllocations.length > 0 && existingAllocations[0].customer !== customerName) {
+            return false;
+          }
+
+          const isOrg = isOrganic(item);
+          if ((type === 'conventional' && isOrg) || (type === 'organic' && !isOrg)) return false;
+
+          return Object.entries(customer.restrictions).every(([key, value]) => {
+            if (!value) return true;
+            return item[key as keyof StockItem] === value;
+          });
         });
-      });
 
-      // Allocate stock to order
-      for (const item of matchingStock) {
-        if (remainingQuantity <= 0) break;
+        let allocatedBatches: AllocationResult[] = [];
+        let totalAllocated = 0;
 
-        const stockWeight = parseFloat(String(item['Stock Weight']).replace(' KG', ''));
-        const allocateQuantity = Math.min(stockWeight, remainingQuantity);
+        for (const item of matchingStock) {
+          if (remainingQuantity <= 0) break;
 
-        // Update allocation
-        item.customer = order.SoldToParty;
-        item.allocatedQuantity = allocateQuantity;
-        item.allocationDetails = {
-          orderNumber: order.Order || '',
-          salesDocument: order['Sales document'],
-          requiredQuantity,
-          allocatedQuantity: allocateQuantity,
-          isPartial: remainingQuantity > allocateQuantity,
-          isSpotSale: order.isSpotSale || false
-        };
+          const stockWeight = parseFloat(String(item['Stock Weight']).replace(' KG', '')) || 0;
+          const existingAllocations = allocationManager.storage.getAllocationsByBatch(item['Batch Number']);
+          const totalAllocatedForBatch = existingAllocations.reduce((sum, a) => sum + (a.quantityKG || 0), 0);
+          const remainingStock = stockWeight - totalAllocatedForBatch;
+          const allocateQuantity = Math.min(remainingStock, remainingQuantity);
 
-        remainingQuantity -= allocateQuantity;
-      }
-    }
+          if (allocateQuantity <= 0) continue;
 
-    setAllocationResults(allocation);
-    setHasAllocated(true);
-    setIsAllocationFlipped(true);
-  }, [stock, customers, orders, dateRange, includeSpotSales]);
+          allocatedBatches.push(item);
+          totalAllocated += allocateQuantity;
+          remainingQuantity -= allocateQuantity;
 
-  const handleFileUpload = (fileData: { data: any[], type: 'stock' | 'orders', filename: string }) => {
-    setIsProcessing(true);
-    if (fileData.type === 'stock') {
-      const processedStock = fileData.data.map(item => ({
-        ...item,
-        'Stock Weight': parseFloat(String(item['Stock Weight']).replace(' KG', '')),
-        'Real Stock Age': parseInt(String(item['Real Stock Age'] || '0'), 10)
-      }));
-      setStock(processedStock);
-    } else if (fileData.type === 'orders') {
-      const processedOrders = fileData.data.map(order => {
-        try {
-          if (!order['Sales document'] || !order['Loading Date']) {
-            console.warn('Missing required fields:', order);
-            return null;
-          }
+          allocationManager.storage.addAllocation({
+            batchNumber: item['Batch Number'],
+            order: '', // No specific order, aggregated by customer
+            salesDocument: '',
+            salesDocumentItem: '10',
+            customer: customerName,
+            allocationDate: new Date().toISOString(),
+            quantityKG: allocateQuantity,
+            status: 'Allocated',
+            materialDescription: item['Material Description'] || '',
+            materialId: item['Material ID'] || '',
+            loadingDate: '', // Not applicable for aggregated allocations
+            originalQuantity: stockWeight
+          });
 
-          // Ensure we have a valid date
-          let loadingDate: Date;
-          const rawDate = order['Loading Date'];
-
-          if (rawDate instanceof Date) {
-            loadingDate = rawDate;
-          } else if (typeof rawDate === 'number') {
-            // Excel date number (days since 1900)
-            loadingDate = new Date(Math.round((rawDate - 25569) * 86400 * 1000));
-          } else {
-            loadingDate = new Date(rawDate);
-          }
-
-          if (isNaN(loadingDate.getTime())) {
-            console.error('Invalid date:', rawDate);
-            return null;
-          }
-
-          const isOrganic = order['Material Description']?.toLowerCase().includes('org') ||
-                          order['Material Description']?.toLowerCase().includes('organic');
-
-          const isSpotSale = order.Material ? 
-            order.Material.startsWith('BCB') || order.Material.startsWith('BOB') :
-            order['Material Description']?.toLowerCase().includes('spot') || false;
-
-          return {
-            ...order,
-            'Loading Date': format(loadingDate, 'yyyy-MM-dd'),
-            Order: order.Order || '',
-            'Sales document': order['Sales document'],
-            'Sales document item': order['Sales Document Item']?.toString() || '10',
-            SalesQuantityKG: String(parseFloat(String(order.SalesQuantityKG || '0').replace(/[^\d.-]/g, ''))),
-            SalesQuantityCS: String(parseFloat(String(order.SalesQuantityCS || '0').replace(/[^\d.-]/g, ''))),
-            Material: order.Material || '',
-            OrderStatus: order.OrderStatus || 'Not Released',
-            isOrganic,
-            isSpotSale
+          item.allocatedQuantity = (item.allocatedQuantity || 0) + allocateQuantity;
+          item.customer = customerName;
+          item.allocationDetails = {
+            orderNumber: '',
+            salesDocument: '',
+            requiredQuantity: totals[type],
+            allocatedQuantity: allocateQuantity,
+            isPartial: remainingQuantity > 0,
+            isSpotSale: type === 'organic' && isSpotSale(orders.find(o => o.SoldToParty === customerName)) || false
           };
-        } catch (error) {
-          console.error('Error processing order:', order, error);
-          return null;
         }
-      }).filter((order): order is OrderItem => order !== null);
 
-      setOrders(processedOrders);
-      
-      // Extract unique customers
-      const uniqueCustomers = Array.from(new Set(processedOrders.map(order => order.SoldToParty)))
-        .filter(Boolean)
-        .map(name => ({
-          id: crypto.randomUUID(),
-          name,
-          restrictions: {}
-        }));
-      setCustomers(uniqueCustomers);
-    }
-    setIsProcessing(false);
-  };
+        // Optimize with larger batches if target not met (for production orders only)
+        if (remainingQuantity > 0 && !isSpotSale(orders.find(o => o.SoldToParty === customerName))) {
+          const largerBatches = matchingStock
+            .filter(item => !allocatedBatches.includes(item))
+            .sort((a, b) => {
+              const weightA = parseFloat(String(a['Stock Weight']).replace(' KG', '')) || 0;
+              const weightB = parseFloat(String(b['Stock Weight']).replace(' KG', '')) || 0;
+              return weightB - weightA; // Sort descending by weight
+            });
 
-  return (
-    <div className="min-h-screen">
-      {!hasEnteredApp ? (
-        <StartPage
-          onDataLoaded={handleFileUpload}
-          uploadedFiles={[
-            ...(stock.length > 0 ? ['stock.xlsx'] : []),
-            ...(orders.length > 0 ? ['orders.xlsx'] : [])
-          ]}
-          onEnter={() => setHasEnteredApp(true)}
-          isProcessing={isProcessing}
-        />
-      ) : (
-        <>
-          <header className="bg-black/40 backdrop-blur-sm border-b border-blue-500/20">
-            <div className="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
-              <div className="flex items-center justify-between">
-                <button
-                  onClick={() => setHasEnteredApp(false)}
-                  className="transition-transform hover:scale-105"
-                >
-                  <Logo />
-                </button>
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => setActiveTab('allocation')}
-                    className={`px-4 py-2 rounded-md transition-colors ${
-                      activeTab === 'allocation'
-                        ? 'bg-blue-600 text-white'
-                        : 'text-blue-400 hover:bg-blue-600/20'
-                    }`}
-                  >
-                    Allocation
-                  </button>
-                  <button
-                    onClick={() => setActiveTab('stock')}
-                    className={`px-4 py-2 rounded-md transition-colors ${
-                      activeTab === 'stock'
-                        ? 'bg-blue-600 text-white'
-                        : 'text-blue-400 hover:bg-blue-600/20'
-                    }`}
-                  >
-                    Stock Dashboard
-                  </button>
-                  <button
-                    onClick={() => setActiveTab('production')}
-                    className={`px-4 py-2 rounded-md transition-colors ${
-                      activeTab === 'production'
-                        ? 'bg-blue-600 text-white'
-                        : 'text-blue-400 hover:bg-blue-600/20'
-                    }`}
-                  >
-                    Production Dashboard
-                  </button>
-                </div>
-              </div>
-            </div>
-          </header>
+          for (const largeBatch of largerBatches) {
+            if (remainingQuantity <= 0) break;
 
-          <main className="container mx-auto px-4 py-6 lg:px-8 space-y-6 max-w-[1920px] relative z-10">
-            {activeTab === 'allocation' ? (
-              <>
-                <div className="relative min-h-[600px] mt-6">
-                  {/* Flip Button */}
-                  <button
-                    onClick={() => setIsAllocationFlipped(state => !state)}
-                    className="absolute right-4 top-4 z-10 bg-blue-600 text-white p-2 rounded-full hover:bg-blue-700 transition-colors"
-                    title={isAllocationFlipped ? "Show Restrictions" : "Show Results"}
-                  >
-                    <ArrowRight className={`w-5 h-5 transition-transform duration-500 ${isAllocationFlipped ? 'rotate-180' : ''}`} />
-                  </button>
+            const stockWeight = parseFloat(String(largeBatch['Stock Weight']).replace(' KG', '')) || 0;
+            const existingAllocations = allocationManager.storage.getAllocationsByBatch(largeBatch['Batch Number']);
+            const totalAllocatedForBatch = existingAllocations.reduce((sum, a) => sum + (a.quantityKG || 0), 0);
+            const remainingStock = stockWeight - totalAllocatedForBatch;
+            const allocateQuantity = Math.min(remainingStock, targetQuantity - totalAllocated);
 
-                  {/* Front Side - Customer Restrictions */}
-                  <animated.div
-                    style={{
-                      opacity: opacity.to(o => 1 - o),
-                      transform,
-                      position: 'absolute',
-                      width: '100%'
-                    }}
-                    className={`${isAllocationFlipped ? 'pointer-events-none' : ''}`}
-                  >
-                    <div className="bg-black/40 backdrop-blur-sm rounded-lg border border-blue-500/20 p-6">
-                      <div className="flex items-center gap-6 mb-6">
-                        <div className="flex items-center gap-2">
-                          <Settings className="w-6 h-6 text-blue-400" />
-                          <h2 className="text-xl font-semibold text-white">Customer Restrictions</h2>
-                        </div>
-                        <button
-                          onClick={allocateFruit}
-                          disabled={!customers.length}
-                          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm transition-all ${
-                            customers.length
-                              ? 'bg-blue-600 text-white hover:bg-blue-700 hover:scale-105 shadow-lg shadow-blue-500/20'
-                              : 'bg-gray-600/50 text-gray-400 cursor-not-allowed'
-                          }`}
-                        >
-                          <span>Allocate</span>
-                        </button>
-                      </div>
-                      {customers.length > 0 ? (
-                        <CustomerList
-                          customers={customers}
-                          stock={stock}
-                          orders={orders}
-                          dateRange={dateRange}
-                          onDateRangeChange={setDateRange}
-                          includeSpotSales={includeSpotSales}
-                          onIncludeSpotSalesChange={setIncludeSpotSales}
-                          onUpdateCustomer={handleUpdateCustomer}
-                          onRemoveCustomer={handleRemoveCustomer}
-                        />
-                      ) : (
-                        <div className="text-blue-300/80 text-sm">
-                          Please upload orders data to see customer list
-                        </div>
-                      )}
-                    </div>
-                  </animated.div>
+            if (allocateQuantity <= 0) continue;
 
-                  {/* Back Side - Allocation Results */}
-                  <animated.div
-                    style={{
-                      opacity,
-                      transform: transform.to(t => `${t} rotateY(180deg)`),
-                      position: 'absolute',
-                      width: '100%'
-                    }}
-                    className={`${!isAllocationFlipped ? 'pointer-events-none' : ''}`}
-                  >
-                    <ScrollablePanel
-                      title="Allocation Results"
-                      headerActions={
-                        <button
-                          onClick={downloadAllocation}
-                          disabled={!hasAllocated}
-                          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm transition-colors ${
-                            hasAllocated
-                              ? 'bg-blue-600 text-white hover:bg-blue-700'
-                              : 'bg-gray-600/50 text-gray-400 cursor-not-allowed'
-                          }`}
-                        >
-                          <Download className="w-4 h-4" />
-                          <span>Export</span>
-                        </button>
-                      }
-                      maxHeight="calc(100vh - 16rem)"
-                    >
-                      {allocationResults.length > 0 ? (
-                        <div className="space-y-4">
-                          {allocationResults.map((result, index) => (
-                            <div
-                              key={`${result['Batch Number']}-${index}`}
-                              className="bg-black/20 rounded-lg p-4 border border-blue-500/10"
-                            >
-                              <div className="flex items-center justify-between">
-                                <div>
-                                  <div className="text-white font-medium">
-                                    Batch: {result['Batch Number']}
-                                  </div>
-                                  <div className="text-blue-300 text-sm mt-1">
-                                    {result['Stock Weight']} KG
-                                  </div>
-                                </div>
-                                <div className="text-right">
-                                  <div className="text-blue-300">
-                                    {result.customer || 'Unallocated'}
-                                  </div>
-                                  {result.allocationDetails && (
-                                    <div className="text-sm text-blue-300/80 mt-1">
-                                      Order: {result.allocationDetails.orderNumber}
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      ) : (
-                        <div className="text-center text-blue-300/80 py-8">
-                          No allocations yet. Run allocation to see results.
-                        </div>
-                      )}
-                    </ScrollablePanel>
-                  </animated.div>
-                </div>
-              </>
-            ) : activeTab === 'stock' ? (
-              <StockDashboard stock={stock} allocationResults={allocationResults} />
-            ) : (
-              <ProductionDashboard 
-                orders={orders}
-                allocationManager={allocationManager}
-              />
-            )}
-          </main>
+            // Remove smaller allocations for this customer/type match
+            const existingSmaller = allocatedBatches.filter(b => 
+              parseFloat(String(b['Stock Weight']).replace(' KG', '')) < stockWeight
+            );
+            existingSmaller.forEach(smallBatch => {
+              const smallAllocations = allocationManager.storage.getAllocationsByBatch(smallBatch['Batch Number']);
+              smallAllocations.forEach(allocation => allocationManager.storage.removeAllocation(allocation.batchNumber));
+              smallBatch.allocatedQuantity = 0;
+              smallBatch.customer = '';
+              smallBatch.allocationDetails = undefined;
+            });
 
-          <SidePanel 
-            isOpen={sidePanelOpen} 
-            onToggle={() => setSidePanelOpen(!sidePanelOpen)}
-            allocationManager={allocationManager}
-            stock={stock}
-          >
-          </SidePanel>
-        </>
-      )}
-    </div>
-  );
-}
+            allocatedBatches = [largeBatch];
+            totalAllocated = allocateQuantity;
+            remainingQuantity = targetQuantity - totalAllocated;
 
-export default App;
+            allocationManager.storage.addAllocation({
+              batchNumber: largeBatch['Batch Number'],
+              order: '',
+              salesDocument: '',
+              salesDocumentItem: '10',
+              customer: customerName,
+              allocationDate: new Date().toISOString(),
+              quantityKG: allocateQuantity,
+              status: 'Allocated',
+              materialDescription: largeBatch['Material Description'] || '',
+              materialId: largeBatch['Material ID'] || '',
+              loadingDate: '',
+              originalQuantity: stockWeight
+            });
+
+            largeBatch.allocatedQuantity = allocateQuantity;
+            largeBatch.customer = customerName;
+            largeBatch.allocationDetails = {
+              orderNumber: '',
+              salesDocument: '',
+              requiredQuantity: totals[type],
+              allocatedQuantity: allocateQuantity,
+              isPartial: remainingQuantity > 0,
+              isSpotSale: false
+            };
+          }
+        }
+
+        if (remainingQuantity > 0) {
+          addNotification({
+            type: 'error',
+            title: 'Insufficient Stock',
