@@ -523,3 +523,656 @@ function App() {
           addNotification({
             type: 'error',
             title: 'Insufficient Stock',
+            message: `Customer ${customerName} (${type} orders) could not be fully allocated. Required: ${totals[type]}KG, Remaining: ${remainingQuantity}KG`
+          });
+        }
+
+        allocationsByCustomer[customerName][type] = allocatedBatches;
+      });
+    });
+
+    // Handle restriction groups
+    const restrictionGroups: Record<string, { customers: string[], totalKG: number, type: 'conventional' | 'organic' }> = {};
+    customers.forEach(customer => {
+      const restrictionKey = JSON.stringify(customer.restrictions);
+      ['conventional', 'organic'].forEach(type => {
+        const total = customerOrders[customer.name]?.[type] || 0;
+        if (total > 0) {
+          if (!restrictionGroups[restrictionKey]) {
+            restrictionGroups[restrictionKey] = { customers: [], totalKG: 0, type };
+          }
+          restrictionGroups[restrictionKey].customers.push(customer.name);
+          restrictionGroups[restrictionKey].totalKG += total;
+        }
+      });
+    });
+
+    Object.entries(restrictionGroups).forEach(([key, group]) => {
+      if (group.totalKG === 0) return;
+
+      const targetQuantity = group.type === 'organic' || !isSpotSale(orders.find(o => group.customers.includes(o.SoldToParty))) 
+        ? group.totalKG * 1.1 // +10% for production orders
+        : group.totalKG; // Exact match for spot sales
+
+      let remainingQuantity = targetQuantity;
+
+      const matchingStock = allocation.filter(item => {
+        const stockWeight = parseFloat(String(item['Stock Weight']).replace(' KG', '')) || 0;
+        const existingAllocations = allocationManager.storage.getAllocationsByBatch(item['Batch Number']);
+        const totalAllocated = existingAllocations.reduce((sum, a) => sum + (a.quantityKG || 0), 0);
+        const remainingStock = stockWeight - totalAllocated;
+
+        if (remainingStock <= 0) return false;
+
+        const isOrg = isOrganic(item);
+        if ((group.type === 'conventional' && isOrg) || (group.type === 'organic' && !isOrg)) return false;
+
+        const customer = customers.find(c => group.customers.includes(c.name));
+        if (!customer) return false;
+
+        return Object.entries(customer.restrictions).every(([key, value]) => {
+          if (!value) return true;
+          return item[key as keyof StockItem] === value;
+        });
+      });
+
+      let allocatedBatches: AllocationResult[] = [];
+      let totalAllocated = 0;
+
+      for (const item of matchingStock) {
+        if (remainingQuantity <= 0) break;
+
+        const stockWeight = parseFloat(String(item['Stock Weight']).replace(' KG', '')) || 0;
+        const existingAllocations = allocationManager.storage.getAllocationsByBatch(item['Batch Number']);
+        const totalAllocatedForBatch = existingAllocations.reduce((sum, a) => sum + (a.quantityKG || 0), 0);
+        const remainingStock = stockWeight - totalAllocatedForBatch;
+        const allocateQuantity = Math.min(remainingStock, remainingQuantity);
+
+        if (allocateQuantity <= 0) continue;
+
+        allocatedBatches.push(item);
+        totalAllocated += allocateQuantity;
+        remainingQuantity -= allocateQuantity;
+
+        group.customers.forEach(customer => {
+          allocationManager.storage.addAllocation({
+            batchNumber: item['Batch Number'],
+            order: '',
+            salesDocument: '',
+            salesDocumentItem: '10',
+            customer,
+            allocationDate: new Date().toISOString(),
+            quantityKG: allocateQuantity / group.customers.length, // Distribute evenly among customers
+            status: 'Allocated',
+            materialDescription: item['Material Description'] || '',
+            materialId: item['Material ID'] || '',
+            loadingDate: '',
+            originalQuantity: stockWeight
+          });
+        });
+
+        item.allocatedQuantity = (item.allocatedQuantity || 0) + allocateQuantity;
+        item.customer = group.customers.join(', ');
+        item.allocationDetails = {
+          orderNumber: '',
+          salesDocument: '',
+          requiredQuantity: group.totalKG,
+          allocatedQuantity: allocateQuantity,
+          isPartial: remainingQuantity > 0,
+          isSpotSale: false
+        };
+      }
+
+      if (remainingQuantity > 0) {
+        addNotification({
+          type: 'error',
+          title: 'Insufficient Stock for Restriction Group',
+          message: `Restriction group (${group.type}) could not be fully allocated. Required: ${group.totalKG}KG, Remaining: ${remainingQuantity}KG`
+        });
+      }
+    });
+
+    setAllocationResults(allocation.filter(a => a.customer));
+    setHasAllocated(true);
+    setIsAllocationFlipped(true);
+    allocationManager.storage.commitAllocationBatch();
+  }, [stock, customers, orders, dateRange, includeSpotSales, isOrganic, isSpotSale]);
+
+  const downloadAllocation = useCallback(() => {
+    if (!allocationResults.length) return;
+
+    const groupedResults = allocationResults.reduce((acc, result) => {
+      const customers = result.customer.split(', ') || [result.customer];
+      customers.forEach(customer => {
+        if (!acc[customer]) acc[customer] = { conventional: [], organic: [] };
+        if (isOrganic(result)) acc[customer].organic.push(result);
+        else acc[customer].conventional.push(result);
+      });
+      return acc;
+    }, {} as Record<string, { conventional: AllocationResult[], organic: AllocationResult[] }>);
+
+    const excelData: any[] = [];
+
+    Object.entries(groupedResults).forEach(([customer, allocations]) => {
+      excelData.push({
+        'Customer': customer,
+        'Location': '',
+        'Batch Number': '',
+        'Stock Weight': '',
+        'Quality': '',
+        'Age': '',
+        'GGN': ''
+      });
+
+      if (allocations.conventional.length > 0) {
+        excelData.push({
+          'Customer': '  Conventional:',
+          'Location': '',
+          'Batch Number': '',
+          'Stock Weight': '',
+          'Quality': '',
+          'Age': '',
+          'GGN': ''
+        });
+
+        allocations.conventional.forEach(item => {
+          excelData.push({
+            'Customer': '',
+            'Location': item.Location || '-',
+            'Batch Number': item['Batch Number'],
+            'Stock Weight': `${item['Stock Weight']} KG`,
+            'Quality': item['Q3: Reinspection Quality'] || '-',
+            'Age': `${item['Real Stock Age']} days`,
+            'GGN': item.GGN || '-'
+          });
+        });
+      }
+
+      if (allocations.organic.length > 0) {
+        excelData.push({
+          'Customer': '  Organic:',
+          'Location': '',
+          'Batch Number': '',
+          'Stock Weight': '',
+          'Quality': '',
+          'Age': '',
+          'GGN': ''
+        });
+
+        allocations.organic.forEach(item => {
+          excelData.push({
+            'Customer': '',
+            'Location': item.Location || '-',
+            'Batch Number': item['Batch Number'],
+            'Stock Weight': `${item['Stock Weight']} KG`,
+            'Quality': item['Q3: Reinspection Quality'] || '-',
+            'Age': `${item['Real Stock Age']} days`,
+            'GGN': item.GGN || '-'
+          });
+        });
+      }
+
+      excelData.push({
+        'Customer': '',
+        'Location': '',
+        'Batch Number': '',
+        'Stock Weight': '',
+        'Quality': '',
+        'Age': '',
+        'GGN': ''
+      });
+    });
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(excelData);
+
+    ws['!cols'] = [
+      { wch: 30 }, // Customer
+      { wch: 15 }, // Location
+      { wch: 15 }, // Batch Number
+      { wch: 15 }, // Stock Weight
+      { wch: 15 }, // Quality
+      { wch: 10 }, // Age
+      { wch: 15 }, // GGN
+    ];
+
+    XLSX.utils.book_append_sheet(wb, ws, 'Allocation');
+    XLSX.writeFile(wb, 'fruit-allocation.xlsx');
+  }, [allocationResults, isOrganic]);
+
+  const toggleCustomerCollapse = (customerName: string) => {
+    setCollapsedCustomers(prev => {
+      const newSet = new Set(prev);
+      if (newSet.has(customerName)) newSet.delete(customerName);
+      else newSet.add(customerName);
+      return newSet;
+    });
+  };
+
+  return (
+    <div className="min-h-screen">
+      {!hasEnteredApp ? (
+        <StartPage
+          onDataLoaded={(fileData) => {
+            setIsProcessing(true);
+            if (fileData.type === 'stock') {
+              handleStockUpload(fileData);
+            } else if (fileData.type === 'orders') {
+              handleOrdersUpload(fileData);
+            }
+            setIsProcessing(false);
+          }}
+          uploadedFiles={uploadedFiles}
+          onEnter={() => setHasEnteredApp(true)}
+          isProcessing={isProcessing}
+        />
+      ) : (
+        <>
+          <AllocationNotifications
+            notifications={notifications}
+            onDismiss={dismissNotification}
+          />
+          
+          <OrganicAllocationModal
+            isOpen={showOrganicModal}
+            onClose={() => setShowOrganicModal(false)}
+            order={currentOrder}
+            availableStock={stock}
+            onConfirm={(supplier) => {
+              if (currentOrder) {
+                const organicStock = stock.filter(item => 
+                  isOrganic(item) && 
+                  !item.customer && 
+                  item.Supplier === supplier
+                );
+                
+                const orderQuantity = parseFloat(currentOrder.SalesQuantityKG.replace(/[^\d.-]/g, '')) || 0;
+                let remainingQuantity = orderQuantity;
+                
+                for (const item of organicStock) {
+                  if (remainingQuantity <= 0) break;
+                  
+                  const stockWeight = parseFloat(String(item['Stock Weight']).replace(' KG', '')) || 0;
+                  const allocateQuantity = Math.min(stockWeight, remainingQuantity);
+                  
+                  const allocationItem = allocationResults.find(r => 
+                    r['Batch Number'] === item['Batch Number']
+                  );
+                  
+                  if (allocationItem) {
+                    allocationItem.customer = currentOrder.SoldToParty;
+                    allocationItem.allocatedQuantity = allocateQuantity;
+                    allocationItem.allocationDetails = {
+                      orderNumber: currentOrder.Order || '',
+                      salesDocument: currentOrder['Sales document'],
+                      requiredQuantity: orderQuantity,
+                      allocatedQuantity,
+                      isPartial: false,
+                      isSpotSale: currentOrder.isSpotSale || false
+                    };
+                  }
+                  
+                  remainingQuantity -= allocateQuantity;
+                }
+                
+                setAllocationResults([...allocationResults]);
+                setShowOrganicModal(false);
+                
+                addNotification({
+                  type: 'warning',
+                  title: 'Organic Stock Allocated',
+                  message: `Allocated organic stock from supplier ${supplier} to order ${currentOrder.Order || currentOrder['Sales document']}`
+                });
+              }
+            }}
+          />
+          
+          <header className="bg-black/40 backdrop-blur-sm border-b border-blue-500/20">
+            <div className="max-w-7xl mx-auto px-4 py-6 sm:px-6 lg:px-8">
+              <div className="flex items-center justify-between">
+                <button
+                  onClick={() => setHasEnteredApp(false)}
+                  className="transition-transform hover:scale-105"
+                >
+                  <Logo />
+                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setActiveTab('allocation')}
+                    className={`px-4 py-2 rounded-md transition-colors ${
+                      activeTab === 'allocation'
+                        ? 'bg-blue-600 text-white'
+                        : 'text-blue-400 hover:bg-blue-600/20'
+                    }`}
+                  >
+                    Allocation
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('stock')}
+                    className={`px-4 py-2 rounded-md transition-colors ${
+                      activeTab === 'stock'
+                        ? 'bg-blue-600 text-white'
+                        : 'text-blue-400 hover:bg-blue-600/20'
+                    }`}
+                  >
+                    Stock Dashboard
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('production')}
+                    className={`px-4 py-2 rounded-md transition-colors ${
+                      activeTab === 'production'
+                        ? 'bg-blue-600 text-white'
+                        : 'text-blue-400 hover:bg-blue-600/20'
+                    }`}
+                  >
+                    Production Dashboard
+                  </button>
+                </div>
+              </div>
+            </div>
+          </header>
+
+          <main className="container mx-auto px-4 py-6 lg:px-8 space-y-6 max-w-[1920px] relative z-10">
+            {activeTab === 'allocation' ? (
+              <>
+                <div className="relative min-h-[600px] mt-6">
+                  <button
+                    onClick={() => setIsAllocationFlipped(state => !state)}
+                    className="absolute right-4 top-4 z-10 bg-blue-600 text-white p-2 rounded-full hover:bg-blue-700 transition-colors"
+                    title={isAllocationFlipped ? "Show Restrictions" : "Show Results"}
+                  >
+                    <ArrowRight className={`w-5 h-5 transition-transform duration-500 ${isAllocationFlipped ? 'rotate-180' : ''}`} />
+                  </button>
+
+                  <animated.div
+                    style={{
+                      opacity: opacity.to(o => 1 - o),
+                      transform,
+                      position: 'absolute',
+                      width: '100%'
+                    }}
+                    className={`${isAllocationFlipped ? 'pointer-events-none' : ''}`}
+                  >
+                    <div className="bg-black/40 backdrop-blur-sm rounded-lg border border-blue-500/20 p-6">
+                      <div className="flex items-center gap-6 mb-6">
+                        <div className="flex items-center gap-2">
+                          <Settings className="h-6 w-6 text-blue-400" />
+                          <h2 className="text-xl font-semibold text-white">Customer Restrictions</h2>
+                        </div>
+                        <div className="flex items-center gap-2 bg-black/40 border border-blue-500/20 rounded-lg overflow-hidden">
+                          <input
+                            type="date"
+                            value={dateRange.start}
+                            onChange={(e) => setDateRange(prev => ({ ...prev, start: e.target.value }))}
+                            className="bg-transparent border-r border-blue-500/20 px-3 py-1.5 text-white text-sm w-36"
+                          />
+                          <input
+                            type="date"
+                            value={dateRange.end}
+                            onChange={(e) => setDateRange(prev => ({ ...prev, end: e.target.value }))}
+                            className="bg-transparent px-3 py-1.5 text-white text-sm w-36"
+                          />
+                        </div>
+                        <button
+                          onClick={allocateFruit}
+                          disabled={!customers.length}
+                          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm transition-all ${
+                            customers.length
+                              ? 'bg-blue-600 text-white hover:bg-blue-700 hover:scale-105 shadow-lg shadow-blue-500/20'
+                              : 'bg-gray-600/50 text-gray-400 cursor-not-allowed'
+                          }`}
+                        >
+                          <span>Allocate</span>
+                        </button>
+                      </div>
+                      {customers.length > 0 ? (
+                        <CustomerList
+                          customers={customers}
+                          stock={stock}
+                          orders={orders}
+                          dateRange={dateRange}
+                          onUpdateCustomer={handleUpdateCustomer}
+                          onRemoveCustomer={handleRemoveCustomer}
+                        />
+                      ) : (
+                        <div className="text-blue-300/80 text-sm">
+                          Please upload orders data to see customer list
+                        </div>
+                      )}
+                    </div>
+                  </animated.div>
+
+                  <animated.div
+                    style={{
+                      opacity,
+                      transform: transform.to(t => `${t} rotateY(180deg)`),
+                      position: 'absolute',
+                      width: '100%'
+                    }}
+                    className={`${!isAllocationFlipped ? 'pointer-events-none' : ''}`}
+                  >
+                    <ScrollablePanel
+                      title="Allocation Results"
+                      headerActions={
+                        <div className="flex items-center gap-2 mr-12">
+                          <button
+                            onClick={() => setIsAllocationFlipped(false)}
+                            className="flex items-center gap-2 px-3 py-1.5 bg-blue-500/10 rounded-lg text-blue-300 hover:bg-blue-500/20 transition-colors text-sm"
+                          >
+                            <span>View Summary</span>
+                          </button>
+                          <button
+                            onClick={downloadAllocation}
+                            disabled={!hasAllocated}
+                            className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm transition-colors ${
+                              hasAllocated
+                                ? 'bg-green-500/20 text-green-300 hover:bg-green-500/30'
+                                : 'bg-gray-500/20 text-gray-400 cursor-not-allowed'
+                            }`}
+                          >
+                            <Download className="w-4 h-4" />
+                            <span>Export</span>
+                          </button>
+                        </div>
+                      }
+                      maxHeight="calc(100vh - 16rem)"
+                    >
+                      <div className="space-y-6">
+                        {Array.from(new Set(allocationResults.map(r => r.customer.split(', ')[0] || r.customer))).map(customerName => {
+                          const customerAllocations = allocationResults.filter(r => r.customer.includes(customerName));
+                          const customerOrders = orders.filter(o => 
+                            o.SoldToParty === customerName &&
+                            format(parseISO(o['Loading Date']), 'yyyy-MM-dd') >= dateRange.start &&
+                            format(parseISO(o['Loading Date']), 'yyyy-MM-dd') <= dateRange.end &&
+                            !['delivered', 'shipped', 'finished', 'in delivery'].includes(o.OrderStatus?.toLowerCase() || '')
+                          );
+                          
+                          const conventionalOrders = customerOrders.filter(o => !o.isOrganic && !o.isSpotSale);
+                          const organicOrders = customerOrders.filter(o => o.isOrganic && !o.isSpotSale);
+                          const spotOrders = customerOrders.filter(o => o.isSpotSale);
+
+                          const conventionalAllocations = customerAllocations.filter(a => !isOrganic(a));
+                          const organicAllocations = customerAllocations.filter(a => isOrganic(a));
+
+                          const conventionalTotal = conventionalOrders.reduce((sum, o) => sum + (parseFloat(o.SalesQuantityKG) || 0), 0);
+                          const organicTotal = organicOrders.reduce((sum, o) => sum + (parseFloat(o.SalesQuantityKG) || 0), 0);
+                          const spotTotal = spotOrders.reduce((sum, o) => sum + (parseFloat(o.SalesQuantityKG) || 0), 0);
+
+                          const conventionalAllocated = conventionalAllocations.reduce((sum, a) => sum + (a.allocatedQuantity || 0), 0);
+                          const organicAllocated = organicAllocations.reduce((sum, a) => sum + (a.allocatedQuantity || 0), 0);
+
+                          const isCollapsed = collapsedCustomers.has(customerName);
+
+                          return (
+                            <div key={customerName} className="bg-black/20 rounded-lg border border-blue-500/10 overflow-hidden">
+                              <button
+                                onClick={() => toggleCustomerCollapse(customerName)}
+                                className="w-full bg-blue-900/20 px-6 py-4 flex items-center justify-between hover:bg-blue-900/30 transition-colors"
+                              >
+                                <h3 className="text-lg font-semibold text-white">{customerName}</h3>
+                                {isCollapsed ? (
+                                  <ChevronDown className="h-5 w-5 text-blue-400" />
+                                ) : (
+                                  <ChevronUp className="h-5 w-5 text-blue-400" />
+                                )}
+                              </button>
+
+                              {!isCollapsed && (
+                                <>
+                                  <div className="px-6 py-3 border-b border-blue-500/10">
+                                    <div className="text-sm text-blue-300 mb-2">Orders:</div>
+                                    
+                                    {conventionalTotal > 0 && (
+                                      <div className="mb-4">
+                                        <h4 className="text-sm font-medium text-blue-400 mb-2">Conventional Orders</h4>
+                                        <div className="space-y-2">
+                                          <p className="text-blue-300 text-sm">
+                                            Total: {conventionalTotal} KG (Target: {conventionalTotal * 1.1} KG)
+                                          </p>
+                                        </div>
+                                      </div>
+                                    )}
+                                    
+                                    {organicTotal > 0 && (
+                                      <div className="mb-4">
+                                        <h4 className="text-sm font-medium text-green-400 mb-2">Organic Orders</h4>
+                                        <div className="space-y-2">
+                                          <p className="text-green-300 text-sm">
+                                            Total: {organicTotal} KG (Target: {organicTotal * 1.1} KG)
+                                          </p>
+                                        </div>
+                                      </div>
+                                    )}
+                                    
+                                    {spotTotal > 0 && (
+                                      <div>
+                                        <h4 className="text-sm font-medium text-yellow-400 mb-2">Spot Sale Orders</h4>
+                                        <div className="space-y-2">
+                                          <p className="text-yellow-300 text-sm">
+                                            Total: {spotTotal} KG
+                                          </p>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                  
+                                  <div className="px-6 py-4">
+                                    {conventionalAllocations.length > 0 && (
+                                      <div className="mb-6">
+                                        <h4 className="text-sm font-medium text-blue-400 mb-2">Conventional Stock</h4>
+                                        <div className="space-y-2">
+                                          {conventionalAllocations.map((item, index) => (
+                                            <div 
+                                              key={`${item.Location || 'no-loc'}-${item['Batch Number']}`}
+                                              className="flex items-center justify-between py-2 px-4 bg-blue-500/5 rounded-lg hover:bg-blue-500/10 transition-colors"
+                                            >
+                                              <div className="flex items-center gap-4">
+                                                <span className="text-blue-300">{item.Location || '-'}</span>
+                                                <span className="text-white">{item['Batch Number']}</span>
+                                                <span className="text-blue-300">{item['Stock Weight']} KG</span>
+                                              </div>
+                                              <div className="flex items-center gap-4">
+                                                <span className="text-blue-300">{item['Q3: Reinspection Quality'] || '-'}</span>
+                                                <span className="text-blue-300">{item['Real Stock Age']} days</span>
+                                                <span className="text-blue-300">GGN: {item.GGN || '-'}</span>
+                                              </div>
+                                            </div>
+                                          ))}
+                                          <p className="text-blue-300 text-sm mt-2">
+                                            Allocated: {conventionalAllocated} KG (+{((conventionalAllocated / conventionalTotal - 1) * 100 || 0).toFixed(1)}% over-allocation)
+                                          </p>
+                                        </div>
+                                      </div>
+                                    )}
+                                    
+                                    {organicAllocations.length > 0 && (
+                                      <div>
+                                        <h4 className="text-sm font-medium text-green-400 mb-2">Organic Stock</h4>
+                                        <div className="space-y-2">
+                                          {organicAllocations.map((item, index) => (
+                                            <div 
+                                              key={`${item.Location || 'no-loc'}-${item['Batch Number']}`}
+                                              className="flex items-center justify-between py-2 px-4 bg-green-500/5 rounded-lg hover:bg-green-500/10 transition-colors"
+                                            >
+                                              <div className="flex items-center gap-4">
+                                                <span className="text-green-300">{item.Location || '-'}</span>
+                                                <span className="text-white">{item['Batch Number']}</span>
+                                                <span className="text-green-300">{item['Stock Weight']} KG</span>
+                                              </div>
+                                              <div className="flex items-center gap-4">
+                                                <span className="text-green-300">{item['Q3: Reinspection Quality'] || '-'}</span>
+                                                <span className="text-green-300">{item['Real Stock Age']} days</span>
+                                                <span className="text-green-300">GGN: {item.GGN || '-'}</span>
+                                              </div>
+                                            </div>
+                                          ))}
+                                          <p className="text-green-300 text-sm mt-2">
+                                            Allocated: {organicAllocated} KG (+{((organicAllocated / organicTotal - 1) * 100 || 0).toFixed(1)}% over-allocation)
+                                          </p>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                </>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </ScrollablePanel>
+                  </animated.div>
+                </div>
+              </>
+            ) : activeTab === 'stock' ? (
+              <>
+                <div className="max-w-[1920px] mx-auto">
+                  <div className="bg-black/40 backdrop-blur-sm rounded-lg border border-blue-500/20 p-8 min-h-[1000px]">
+                    <div className="flex items-center mb-4">
+                      <LayoutDashboard className="h-6 w-6 text-blue-400 mr-2" />
+                      <h2 className="text-xl font-semibold text-white">Stock Dashboard</h2>
+                    </div>
+                    {stock.length > 0 ? (
+                      <StockDashboard stock={stock} allocationResults={allocationResults} />
+                    ) : (
+                      <div className="text-blue-300/80 text-sm">
+                        Please upload stock data to view the dashboard
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="max-w-[1920px] mx-auto">
+                  <div className="bg-black/40 backdrop-blur-sm rounded-lg border border-blue-500/20 p-8 min-h-[1000px]">
+                    <div className="flex items-center mb-4">
+                      <LayoutDashboard className="h-6 w-6 text-blue-400 mr-2" />
+                      <h2 className="text-xl font-semibold text-white">Production Dashboard</h2>
+                    </div>
+                    {orders.length > 0 ? (
+                      <ProductionDashboard 
+                        orders={orders}
+                        allocationManager={allocationManager}
+                      />
+                    ) : (
+                      <div className="text-blue-300/80 text-sm">Please upload orders data to view the dashboard</div>
+                    )}
+                  </div>
+                </div>
+              </>
+            )}
+          </main>
+
+          <SidePanel 
+            isOpen={sidePanelOpen} 
+            onToggle={() => setSidePanelOpen(!sidePanelOpen)}
+            allocationManager={allocationManager}
+            stock={stock}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+export default App;
